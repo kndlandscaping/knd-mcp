@@ -122,6 +122,157 @@ async function supabaseSelect(
 }
 
 // ---------------------------------------------------------------------------
+// P&L summary parser -- extracts key line items from raw QBO payload
+// ---------------------------------------------------------------------------
+
+function parsePLSummary(payload: Record<string, unknown>): Record<string, unknown> | null {
+  const rows = ((payload?.Rows as Record<string, unknown>)?.Row) as Record<string, unknown>[];
+  if (!rows) return null;
+
+  const header = payload.Header as Record<string, unknown>;
+
+  // Get value from ColData array [label, value]
+  const colVal = (colData: unknown): number => {
+    const arr = colData as Record<string, unknown>[];
+    return parseFloat((arr?.[1] as Record<string, unknown>)?.value as string ?? '0') || 0;
+  };
+
+  // Find a section by its group name
+  const findGroup = (group: string): Record<string, unknown> | undefined =>
+    rows.find((r) => (r as Record<string, unknown>).group === group) as Record<string, unknown> | undefined;
+
+  // Recursively find a row by account id -- matches Data rows and Section headers
+  function findById(rowArr: Record<string, unknown>[], id: string): number | null {
+    for (const r of rowArr) {
+      if (r.type === 'Section') {
+        const hid = ((r.Header as Record<string, unknown>)?.ColData as Record<string, unknown>[])?.[0]?.id;
+        if (hid === id) {
+          return colVal((r.Summary as Record<string, unknown>)?.ColData);
+        }
+        const sub = (r.Rows as Record<string, unknown>)?.Row as Record<string, unknown>[];
+        if (sub) { const v = findById(sub, id); if (v !== null) return v; }
+      }
+      if (r.type === 'Data') {
+        const did = (r.ColData as Record<string, unknown>[])?.[0]?.id;
+        if (did === id) return colVal(r.ColData);
+        const sub = (r.Rows as Record<string, unknown>)?.Row as Record<string, unknown>[];
+        if (sub) { const v = findById(sub, id); if (v !== null) return v; }
+      }
+    }
+    return null;
+  }
+
+  const fmt = (n: number | null) => Math.round((n ?? 0) * 100) / 100;
+  const pct = (n: number, d: number) => d !== 0 ? Math.round(n / d * 10000) / 100 : 0;
+
+  // ---- Revenue ----
+  const incSec = findGroup('Income');
+  const incRows = ((incSec?.Rows as Record<string, unknown>)?.Row as Record<string, unknown>[]) ?? [];
+  const totalRevenue = colVal((incSec?.Summary as Record<string, unknown>)?.ColData);
+  const commercialRev   = fmt(findById(incRows, '56'));
+  const residentialRev  = fmt(findById(incRows, '57'));
+  const maintenanceRev  = fmt(findById(incRows, '48'));
+  const enhancementsRev = fmt(findById(incRows, '153'));
+  const irrigationRev   = fmt(findById(incRows, '353'));
+  const designRev       = fmt(findById(incRows, '403'));
+
+  // ---- COGS ----
+  const cogsSec = findGroup('COGS');
+  const cogsRows = ((cogsSec?.Rows as Record<string, unknown>)?.Row as Record<string, unknown>[]) ?? [];
+  const totalCOGS = colVal((cogsSec?.Summary as Record<string, unknown>)?.ColData);
+  const commercialCOGS   = fmt(findById(cogsRows, '314'));
+  const residentialCOGS  = fmt(findById(cogsRows, '320'));
+  const maintenanceCOGS  = fmt(findById(cogsRows, '326'));
+  const enhancementsCOGS = fmt(findById(cogsRows, '332'));
+  const irrigationCOGS   = fmt(findById(cogsRows, '338'));
+  const designCOGS       = fmt(findById(cogsRows, '404'));
+
+  // ---- Gross Profit ----
+  const gpSec = findGroup('GrossProfit');
+  const grossProfit = colVal((gpSec?.Summary as Record<string, unknown>)?.ColData);
+
+  // ---- Expenses ----
+  const expSec = findGroup('Expenses');
+  const expRows = ((expSec?.Rows as Record<string, unknown>)?.Row as Record<string, unknown>[]) ?? [];
+  const totalExpenses = colVal((expSec?.Summary as Record<string, unknown>)?.ColData);
+  const gaExpenses    = fmt(findById(expRows, '91'));
+  const opsExpenses   = fmt(findById(expRows, '269'));
+  const salesExpenses = fmt(findById(expRows, '261'));
+
+  // ---- Net Operating Income ----
+  const noiSec = findGroup('NetOperatingIncome');
+  const netOperatingIncome = colVal((noiSec?.Summary as Record<string, unknown>)?.ColData);
+
+  // ---- Other Income / Expenses ----
+  const otherIncSec = findGroup('OtherIncome');
+  const totalOtherIncome = colVal((otherIncSec?.Summary as Record<string, unknown>)?.ColData);
+  const otherExpSec = findGroup('OtherExpenses');
+  const totalOtherExpenses = colVal((otherExpSec?.Summary as Record<string, unknown>)?.ColData);
+
+  // ---- Net Income ----
+  const netIncSec = findGroup('NetIncome');
+  const netIncome = colVal((netIncSec?.Summary as Record<string, unknown>)?.ColData);
+
+  const divisionGP = (rev: number, cogs: number) => fmt(rev - cogs);
+  const divisionGM = (rev: number, cogs: number) => pct(rev - cogs, rev);
+
+  return {
+    period_start: header?.StartPeriod,
+    period_end: header?.EndPeriod,
+    class_name: null, // overridden by caller if class-level
+    currency: header?.Currency ?? 'USD',
+
+    revenue: {
+      commercial:   commercialRev,
+      residential:  residentialRev,
+      maintenance:  maintenanceRev,
+      enhancements: enhancementsRev,
+      irrigation:   irrigationRev,
+      design:       designRev,
+      total:        fmt(totalRevenue),
+    },
+
+    cogs: {
+      commercial:   commercialCOGS,
+      residential:  residentialCOGS,
+      maintenance:  maintenanceCOGS,
+      enhancements: enhancementsCOGS,
+      irrigation:   irrigationCOGS,
+      design:       designCOGS,
+      total:        fmt(totalCOGS),
+    },
+
+    gross_profit_by_division: {
+      commercial:   { gp: divisionGP(commercialRev, commercialCOGS),   gm_pct: divisionGM(commercialRev, commercialCOGS) },
+      residential:  { gp: divisionGP(residentialRev, residentialCOGS), gm_pct: divisionGM(residentialRev, residentialCOGS) },
+      maintenance:  { gp: divisionGP(maintenanceRev, maintenanceCOGS), gm_pct: divisionGM(maintenanceRev, maintenanceCOGS) },
+      enhancements: { gp: divisionGP(enhancementsRev, enhancementsCOGS), gm_pct: divisionGM(enhancementsRev, enhancementsCOGS) },
+      irrigation:   { gp: divisionGP(irrigationRev, irrigationCOGS),   gm_pct: divisionGM(irrigationRev, irrigationCOGS) },
+      design:       { gp: divisionGP(designRev, designCOGS),           gm_pct: divisionGM(designRev, designCOGS) },
+    },
+
+    gross_profit:      fmt(grossProfit),
+    gross_margin_pct:  pct(grossProfit, totalRevenue),
+
+    expenses: {
+      general_and_administrative: gaExpenses,
+      operations:                 opsExpenses,
+      sales_and_marketing:        salesExpenses,
+      total:                      fmt(totalExpenses),
+    },
+
+    net_operating_income:     fmt(netOperatingIncome),
+    noi_margin_pct:           pct(netOperatingIncome, totalRevenue),
+
+    other_income:             fmt(totalOtherIncome),
+    other_expenses:           fmt(totalOtherExpenses),
+
+    net_income:               fmt(netIncome),
+    net_income_margin_pct:    pct(netIncome, totalRevenue),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // MCP tool definitions
 // ---------------------------------------------------------------------------
 
@@ -191,6 +342,30 @@ const TOOLS = [
         },
       },
       required: ["budget_id"],
+    },
+  },
+  {
+    name: "get_pl_summary",
+    description:
+      "Get a clean, structured P&L summary for a specific period and optional class. Returns revenue, COGS, and GP by division, plus expense categories and net income -- all as flat numbers ready for analysis. Preferred over get_profit_and_loss for most financial questions. Call list_available_periods first to confirm valid period/class combinations.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        period_start: {
+          type: "string",
+          description: "Report start date in YYYY-MM-DD format (e.g. 2025-01-01)",
+        },
+        period_end: {
+          type: "string",
+          description: "Report end date in YYYY-MM-DD format (e.g. 2025-12-31)",
+        },
+        class_name: {
+          type: "string",
+          description:
+            "Optional QBO class name (e.g. Commercial, MEW, Residential, SLO). Omit for company-wide totals.",
+        },
+      },
+      required: ["period_start", "period_end"],
     },
   },
 ];
@@ -283,6 +458,28 @@ async function handleTool(
     );
     if (!data || data.length === 0) throw new Error(`Budget ${args.budget_id} not found`);
     return data[0];
+  }
+
+  if (name === "get_pl_summary") {
+    if (typeof args.period_start !== "string" || typeof args.period_end !== "string")
+      throw new Error("period_start and period_end are required");
+    const params: Record<string, string> = {
+      report_type: "eq.ProfitAndLoss",
+      period_start: `eq.${args.period_start}`,
+      period_end: `eq.${args.period_end}`,
+      order: "fetched_at.desc",
+      limit: "1",
+    };
+    if (typeof args.class_name === "string") params["class_name"] = `eq.${args.class_name}`;
+    else params["class_name"] = "is.null";
+    const data = await supabaseSelect("qbo_reports", params, "class_name,payload,fetched_at");
+    if (!data || data.length === 0)
+      throw new Error(`No P&L found for ${args.period_start} to ${args.period_end}${args.class_name ? ` / ${args.class_name}` : ""}`);
+    const row = data[0] as Record<string, unknown>;
+    const summary = parsePLSummary(row.payload as Record<string, unknown>);
+    if (!summary) throw new Error("Failed to parse P&L payload");
+    summary.class_name = row.class_name ?? null;
+    return summary;
   }
 
   throw new Error(`Unknown tool: ${name}`);
