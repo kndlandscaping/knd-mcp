@@ -368,6 +368,13 @@ export default async function handler(req: Request, _ctx: Context) {
   // -------------------------------------------------------------------------
   // OAuth metadata discovery
   // -------------------------------------------------------------------------
+  if (path === "/.well-known/oauth-protected-resource") {
+    return jsonRes({
+      resource: BASE_URL,
+      authorization_servers: [BASE_URL],
+    });
+  }
+
   if (path === "/.well-known/oauth-authorization-server") {
     return jsonRes({
       issuer: BASE_URL,
