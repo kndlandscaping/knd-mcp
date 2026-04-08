@@ -63,7 +63,9 @@ async function verifyCode(
   const [payload, sig] = parts;
   if (!(await hmacVerify(payload, sig, secret))) return null;
   try {
-    const json = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")));
+    const b64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - b64.length % 4) % 4);
+    const json = JSON.parse(atob(padded));
     if (Date.now() - json.ts > 5 * 60 * 1000) return null;
     return json;
   } catch {
