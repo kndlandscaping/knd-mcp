@@ -513,7 +513,7 @@ export default async function handler(req: Request, _ctx: Context) {
         return jsonRes(
           { jsonrpc: "2.0", id, error: { code: -32000, message: "Unauthorized" } },
           401,
-          { "WWW-Authenticate": `Bearer realm="${BASE_URL}"` }
+          { "WWW-Authenticate": `Bearer realm="${BASE_URL}", resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"` }
         );
       }
       const toolName = params?.name;
