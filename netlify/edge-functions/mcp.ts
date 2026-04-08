@@ -479,14 +479,6 @@ export default async function handler(req: Request, _ctx: Context) {
     token === MCP_SECRET ||
     (token.length > 0 && (await verifyAccessToken(token, MCP_SECRET)));
 
-  if (!authed) {
-    return jsonRes(
-      { jsonrpc: "2.0", id: null, error: { code: -32000, message: "Unauthorized" } },
-      401,
-      { "WWW-Authenticate": `Bearer realm="${BASE_URL}"` }
-    );
-  }
-
   let body: { id?: unknown; method?: string; params?: Record<string, unknown> };
   try {
     body = await req.json();
@@ -500,6 +492,8 @@ export default async function handler(req: Request, _ctx: Context) {
     jsonRes({ jsonrpc: "2.0", id, error: { code, message } });
 
   try {
+    // Handshake methods allowed without auth so claude.ai can verify the
+    // server is reachable before initiating the OAuth flow
     if (method === "initialize") {
       return ok({
         protocolVersion: "2024-11-05",
@@ -510,13 +504,23 @@ export default async function handler(req: Request, _ctx: Context) {
     if (method === "notifications/initialized") return new Response(null, { status: 204, headers: CORS });
     if (method === "ping") return ok({});
     if (method === "tools/list") return ok({ tools: TOOLS });
+
+    // All tool calls require auth
     if (method === "tools/call") {
+      if (!authed) {
+        return jsonRes(
+          { jsonrpc: "2.0", id, error: { code: -32000, message: "Unauthorized" } },
+          401,
+          { "WWW-Authenticate": `Bearer realm="${BASE_URL}"` }
+        );
+      }
       const toolName = params?.name;
       const toolArgs = (params?.arguments ?? {}) as Record<string, unknown>;
       if (typeof toolName !== "string") return err(-32602, "Invalid params: name required");
       const result = await handleTool(toolName, toolArgs);
       return ok({ content: [{ type: "text", text: JSON.stringify(result, null, 2) }] });
     }
+
     return err(-32601, `Method not found: ${method}`);
   } catch (e) {
     return err(-32603, e instanceof Error ? e.message : String(e));
