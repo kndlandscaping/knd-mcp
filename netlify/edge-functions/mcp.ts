@@ -382,10 +382,27 @@ export default async function handler(req: Request, _ctx: Context) {
       issuer: BASE_URL,
       authorization_endpoint: `${BASE_URL}/authorize`,
       token_endpoint: `${BASE_URL}/token`,
+      registration_endpoint: `${BASE_URL}/register`,
       response_types_supported: ["code"],
       grant_types_supported: ["authorization_code"],
       code_challenge_methods_supported: ["S256"],
       token_endpoint_auth_methods_supported: ["none"],
+      scopes_supported: ["read"],
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Dynamic client registration (RFC 7591)
+  // claude.ai registers itself before initiating the OAuth flow
+  // -------------------------------------------------------------------------
+  if (path === "/register" && req.method === "POST") {
+    return jsonRes({
+      client_id: "claude-ai",
+      client_id_issued_at: Math.floor(Date.now() / 1000),
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code"],
+      response_types: ["code"],
+      code_challenge_methods_supported: ["S256"],
     });
   }
 
