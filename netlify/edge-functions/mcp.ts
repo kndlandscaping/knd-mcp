@@ -695,6 +695,15 @@ export default async function handler(req: Request, _ctx: Context) {
     token === MCP_SECRET ||
     (token.length > 0 && (await verifyAccessToken(token, MCP_SECRET)));
 
+  // Only POST requests carry a JSON-RPC body
+  if (req.method !== "POST") {
+    return jsonRes(
+      { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request: POST required" } },
+      405,
+      { Allow: "POST" }
+    );
+  }
+
   let body: { id?: unknown; method?: string; params?: Record<string, unknown> };
   try {
     body = await req.json();
