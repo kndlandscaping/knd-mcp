@@ -695,13 +695,14 @@ export default async function handler(req: Request, _ctx: Context) {
     token === MCP_SECRET ||
     (token.length > 0 && (await verifyAccessToken(token, MCP_SECRET)));
 
+  // GET on root = health check, return 200 so claude.ai knows server is alive
+  if (req.method === "GET") {
+    return jsonRes({ status: "ok", server: "knd-qbo", version: "3.0.0" });
+  }
+
   // Only POST requests carry a JSON-RPC body
   if (req.method !== "POST") {
-    return jsonRes(
-      { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request: POST required" } },
-      405,
-      { Allow: "POST" }
-    );
+    return new Response(null, { status: 405, headers: { ...CORS, Allow: "GET, POST" } });
   }
 
   let body: { id?: unknown; method?: string; params?: Record<string, unknown> };
