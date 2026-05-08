@@ -122,6 +122,148 @@ async function supabaseSelect(
 }
 
 // ---------------------------------------------------------------------------
+// Class/column resolution helpers (fix: extract a class column from a
+// ProfitAndLossByClass payload to enable real per-class filtering)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a user-supplied class name to a column index in a
+ * ProfitAndLossByClass payload's Columns.Column array.
+ *
+ * Rules (priority order):
+ *   1. If class_name contains ":" (e.g. "Residential:Design"), normalize to
+ *      the part after the last ":" because QBO's by-class report stores
+ *      subclasses by their leaf name only ("Design", not "Residential:Design").
+ *   2. If a column titled "Total {normalized}" exists, prefer that. This is
+ *      the rollup including subclasses, which is what callers usually want
+ *      for parent classes (e.g. "Residential" -> "Total Residential", which
+ *      includes Design). Skipped if includeSubclasses === false.
+ *   3. Exact match on normalized name.
+ *   4. Fallback: exact match on the original class_name.
+ */
+function resolveClassColumn(
+  columnTitles: string[],
+  className: string,
+  includeSubclasses = true
+): { idx: number; resolved: string } | null {
+  const normalized = className.includes(":")
+    ? (className.split(":").pop() as string).trim()
+    : className.trim();
+
+  if (includeSubclasses) {
+    const totalKey = `Total ${normalized}`;
+    const totalIdx = columnTitles.indexOf(totalKey);
+    if (totalIdx >= 0) return { idx: totalIdx, resolved: totalKey };
+  }
+
+  const exactIdx = columnTitles.indexOf(normalized);
+  if (exactIdx >= 0) return { idx: exactIdx, resolved: normalized };
+
+  if (normalized !== className) {
+    const origIdx = columnTitles.indexOf(className);
+    if (origIdx >= 0) return { idx: origIdx, resolved: className };
+  }
+
+  return null;
+}
+
+/**
+ * Reduce a ProfitAndLossByClass payload to a single-class P&L payload by
+ * deep-cloning the tree and replacing every ColData array with
+ * [label, class_value]. The result is structurally identical to a regular
+ * single-column ProfitAndLoss payload, so existing parsing code (e.g.
+ * parsePLSummary) consumes it without changes.
+ */
+function reduceToClassColumn(
+  payload: Record<string, unknown>,
+  classIdx: number
+): Record<string, unknown> {
+  const cloned = JSON.parse(JSON.stringify(payload)) as Record<string, unknown>;
+
+  function walk(node: Record<string, unknown> | null | undefined): void {
+    if (!node || typeof node !== "object") return;
+
+    const colData = node.ColData as Record<string, unknown>[] | undefined;
+    if (Array.isArray(colData) && colData.length > 1) {
+      const label = colData[0] ?? { value: "" };
+      const val = colData[classIdx] ?? { value: "" };
+      node.ColData = [label, val];
+    }
+
+    const innerRows = (node.Rows as Record<string, unknown> | undefined)?.Row;
+    if (Array.isArray(innerRows)) {
+      innerRows.forEach((r) => walk(r as Record<string, unknown>));
+    }
+    if (node.Header) walk(node.Header as Record<string, unknown>);
+    if (node.Summary) walk(node.Summary as Record<string, unknown>);
+  }
+
+  if (cloned?.Rows) walk(cloned.Rows as Record<string, unknown>);
+
+  const columns = cloned?.Columns as Record<string, unknown> | undefined;
+  const colArr = columns?.Column as Record<string, unknown>[] | undefined;
+  if (Array.isArray(colArr)) {
+    const accountCol = colArr[0];
+    const classCol = colArr[classIdx] ?? { ColType: "Money" };
+    (cloned.Columns as Record<string, unknown>).Column = [accountCol, classCol];
+  }
+
+  return cloned;
+}
+
+/**
+ * Load the most recent ProfitAndLossByClass payload for a period and reduce
+ * it to a single-class single-column P&L payload. Throws clear errors if
+ * the period or class isn't found.
+ */
+async function loadByClassPayload(
+  period_start: string,
+  period_end: string,
+  className: string,
+  includeSubclasses: boolean
+): Promise<{
+  payload: Record<string, unknown>;
+  resolved_class_name: string;
+  fetched_at: unknown;
+}> {
+  const data = await supabaseSelect(
+    "qbo_reports",
+    {
+      report_type: "eq.ProfitAndLossByClass",
+      period_start: `eq.${period_start}`,
+      period_end: `eq.${period_end}`,
+      order: "fetched_at.desc",
+      limit: "1",
+    },
+    "payload,fetched_at"
+  );
+  if (!data || data.length === 0) {
+    throw new Error(
+      `No ProfitAndLossByClass report stored for ${period_start} to ${period_end}. ` +
+        `Class-filtered queries require this report. Call list_available_periods to see what's available.`
+    );
+  }
+  const row = data[0] as Record<string, unknown>;
+  const payload = row.payload as Record<string, unknown>;
+  const colArr =
+    ((payload?.Columns as Record<string, unknown>)?.Column as Record<string, unknown>[]) ?? [];
+  const titles = colArr.map((c) => String(c?.ColTitle ?? ""));
+  const resolved = resolveClassColumn(titles, className, includeSubclasses);
+  if (!resolved) {
+    throw new Error(
+      `Class '${className}' not found in by-class report. Available columns: ${titles
+        .filter(Boolean)
+        .join(", ")}`
+    );
+  }
+  return {
+    payload: reduceToClassColumn(payload, resolved.idx),
+    resolved_class_name: resolved.resolved,
+    fetched_at: row.fetched_at,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // P&L summary parser -- extracts key line items from raw QBO payload
 // ---------------------------------------------------------------------------
 
@@ -295,7 +437,7 @@ const TOOLS = [
   {
     name: "get_profit_and_loss",
     description:
-      "Get a Profit & Loss report for a specific period and optional class. Returns the full QBO P&L payload including revenue, COGS, gross profit, and expenses. Call list_available_periods first to confirm valid period/class combinations.",
+      "Get a Profit & Loss report for a specific period and optional class. Returns the full QBO P&L payload including revenue, COGS, gross profit, and expenses. When class_name is provided, the report is filtered to that class using the QBO ProfitAndLossByClass data; for parent classes (e.g. Residential, MEW, SLO) the rollup including subclasses is returned by default.",
     inputSchema: {
       type: "object",
       properties: {
@@ -310,7 +452,12 @@ const TOOLS = [
         class_name: {
           type: "string",
           description:
-            "Optional QBO class name (e.g. Commercial, MEW, Residential, SLO). Omit for company-wide totals.",
+            "Optional QBO class name (e.g. Commercial, MEW, Residential, Residential:Design, SLO). Omit for company-wide totals. For parent classes, includes subclass rollup by default (e.g. Residential includes Design).",
+        },
+        include_subclasses: {
+          type: "boolean",
+          description:
+            "When class_name is a parent class (e.g. Residential), whether to include subclass rollups. Defaults to true. Set to false to get the parent class only.",
         },
       },
       required: ["period_start", "period_end"],
@@ -347,7 +494,7 @@ const TOOLS = [
   {
     name: "get_pl_summary",
     description:
-      "Get a clean, structured P&L summary for a specific period and optional class. Returns revenue, COGS, and GP by division, plus expense categories and net income -- all as flat numbers ready for analysis. Preferred over get_profit_and_loss for most financial questions. Call list_available_periods first to confirm valid period/class combinations.",
+      "Get a clean, structured P&L summary for a specific period and optional class. Returns revenue, COGS, and GP by division, plus expense categories and net income -- all as flat numbers ready for analysis. Preferred over get_profit_and_loss for most financial questions. When class_name is provided, returns class-specific totals (using ProfitAndLossByClass data); for parent classes (e.g. Residential), defaults to include subclass rollups.",
     inputSchema: {
       type: "object",
       properties: {
@@ -362,7 +509,12 @@ const TOOLS = [
         class_name: {
           type: "string",
           description:
-            "Optional QBO class name (e.g. Commercial, MEW, Residential, SLO). Omit for company-wide totals.",
+            "Optional QBO class name (e.g. Commercial, MEW, Residential, Residential:Design, SLO). Omit for company-wide totals.",
+        },
+        include_subclasses: {
+          type: "boolean",
+          description:
+            "For parent classes, whether to include subclass rollups. Defaults to true.",
         },
       },
       required: ["period_start", "period_end"],
@@ -406,28 +558,46 @@ async function handleTool(
     ) {
       throw new Error("period_start and period_end are required");
     }
-    const params: Record<string, string> = {
-      report_type: "eq.ProfitAndLoss",
-      period_start: `eq.${args.period_start}`,
-      period_end: `eq.${args.period_end}`,
-      order: "fetched_at.desc",
-      limit: "1",
-    };
-    if (typeof args.class_name === "string") {
-      params["class_name"] = `eq.${args.class_name}`;
-    } else {
-      params["class_name"] = "is.null";
+
+    const className =
+      typeof args.class_name === "string" ? args.class_name : null;
+    const includeSubclasses =
+      args.include_subclasses === undefined ? true : !!args.include_subclasses;
+
+    if (className) {
+      const r = await loadByClassPayload(
+        args.period_start,
+        args.period_end,
+        className,
+        includeSubclasses
+      );
+      return {
+        report_type: "ProfitAndLoss",
+        period_start: args.period_start,
+        period_end: args.period_end,
+        class_name: className,
+        resolved_class_name: r.resolved_class_name,
+        payload: r.payload,
+        fetched_at: r.fetched_at,
+      };
     }
+
+    // Company-wide path (unchanged)
     const data = await supabaseSelect(
       "qbo_reports",
-      params,
+      {
+        report_type: "eq.ProfitAndLoss",
+        period_start: `eq.${args.period_start}`,
+        period_end: `eq.${args.period_end}`,
+        class_name: "is.null",
+        order: "fetched_at.desc",
+        limit: "1",
+      },
       "report_type,period_start,period_end,class_name,payload,fetched_at"
     );
     if (!data || data.length === 0) {
       throw new Error(
-        `No P&L found for ${args.period_start} to ${args.period_end}${
-          args.class_name ? ` / ${args.class_name}` : ""
-        }`
+        `No P&L found for ${args.period_start} to ${args.period_end}`
       );
     }
     return data[0];
@@ -463,18 +633,43 @@ async function handleTool(
   if (name === "get_pl_summary") {
     if (typeof args.period_start !== "string" || typeof args.period_end !== "string")
       throw new Error("period_start and period_end are required");
-    const params: Record<string, string> = {
-      report_type: "eq.ProfitAndLoss",
-      period_start: `eq.${args.period_start}`,
-      period_end: `eq.${args.period_end}`,
-      order: "fetched_at.desc",
-      limit: "1",
-    };
-    if (typeof args.class_name === "string") params["class_name"] = `eq.${args.class_name}`;
-    else params["class_name"] = "is.null";
-    const data = await supabaseSelect("qbo_reports", params, "class_name,payload,fetched_at");
+
+    const className =
+      typeof args.class_name === "string" ? args.class_name : null;
+    const includeSubclasses =
+      args.include_subclasses === undefined ? true : !!args.include_subclasses;
+
+    if (className) {
+      const r = await loadByClassPayload(
+        args.period_start,
+        args.period_end,
+        className,
+        includeSubclasses
+      );
+      const summary = parsePLSummary(r.payload);
+      if (!summary) throw new Error("Failed to parse P&L payload");
+      summary.class_name = className;
+      summary.resolved_class_name = r.resolved_class_name;
+      return summary;
+    }
+
+    // Company-wide path (unchanged)
+    const data = await supabaseSelect(
+      "qbo_reports",
+      {
+        report_type: "eq.ProfitAndLoss",
+        period_start: `eq.${args.period_start}`,
+        period_end: `eq.${args.period_end}`,
+        class_name: "is.null",
+        order: "fetched_at.desc",
+        limit: "1",
+      },
+      "class_name,payload,fetched_at"
+    );
     if (!data || data.length === 0)
-      throw new Error(`No P&L found for ${args.period_start} to ${args.period_end}${args.class_name ? ` / ${args.class_name}` : ""}`);
+      throw new Error(
+        `No P&L found for ${args.period_start} to ${args.period_end}`
+      );
     const row = data[0] as Record<string, unknown>;
     const summary = parsePLSummary(row.payload as Record<string, unknown>);
     if (!summary) throw new Error("Failed to parse P&L payload");
@@ -697,7 +892,7 @@ export default async function handler(req: Request, _ctx: Context) {
 
   // GET on root = health check, return 200 so claude.ai knows server is alive
   if (req.method === "GET") {
-    return jsonRes({ status: "ok", server: "knd-qbo", version: "3.0.0" });
+    return jsonRes({ status: "ok", server: "knd-qbo", version: "3.1.0" });
   }
 
   // Only POST requests carry a JSON-RPC body
@@ -724,7 +919,7 @@ export default async function handler(req: Request, _ctx: Context) {
       return ok({
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "knd-qbo", version: "3.0.0" },
+        serverInfo: { name: "knd-qbo", version: "3.1.0" },
       });
     }
     if (method === "notifications/initialized") return new Response(null, { status: 204, headers: CORS });
