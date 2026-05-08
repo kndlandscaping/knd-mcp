@@ -198,7 +198,12 @@ function reduceToClassColumn(
     if (node.Summary) walk(node.Summary as Record<string, unknown>);
   }
 
-  if (cloned?.Rows) walk(cloned.Rows as Record<string, unknown>);
+  const topRows = (cloned?.Rows as Record<string, unknown> | undefined)?.Row as
+    | Record<string, unknown>[]
+    | undefined;
+  if (Array.isArray(topRows)) {
+    topRows.forEach((r) => walk(r));
+  }
 
   const columns = cloned?.Columns as Record<string, unknown> | undefined;
   const colArr = columns?.Column as Record<string, unknown>[] | undefined;
