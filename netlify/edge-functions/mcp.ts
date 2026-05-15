@@ -19,7 +19,7 @@ const MCP_SECRET            = Netlify.env.get("MCP_SECRET")            ?? ""
 const SUPABASE_URL          = Netlify.env.get("SUPABASE_URL")          ?? ""
 const SUPABASE_SERVICE_KEY  = Netlify.env.get("SUPABASE_SERVICE_KEY")  ?? ""
 const BASE_URL              = Netlify.env.get("BASE_URL")              ?? "https://mcp.kndlandscaping.com"
-const DEPLOY_VERSION        = "4.0.0"
+const DEPLOY_VERSION        = "4.1.0"
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
@@ -654,6 +654,20 @@ export default async (req: Request, _context: unknown) => {
     })
   }
 
+  // OAuth Protected Resource Metadata (RFC 9728). MCP clients hit this on a
+  // 401 to discover which authorization server to use, keyed off the
+  // `resource_metadata` parameter in the WWW-Authenticate header below.
+  // Without this, clients that get a 401 can't reliably reuse a stored token
+  // and fall back to a full OAuth flow.
+  if (path.endsWith("/.well-known/oauth-protected-resource")) {
+    return jsonRes({
+      resource: BASE_URL,
+      authorization_servers: [BASE_URL],
+      scopes_supported: ["read"],
+      bearer_methods_supported: ["header"],
+    })
+  }
+
   // RFC 7591 Dynamic Client Registration. Production exposes this and Claude's
   // MCP client uses it. Minimal implementation that returns a synthesized
   // client_id (the registration is purely informational - we don't enforce
@@ -756,7 +770,7 @@ export default async (req: Request, _context: unknown) => {
       return jsonRes(
         { jsonrpc: "2.0", id: body.id ?? null, error: { code: -32000, message: "Unauthorized" } },
         401,
-        { "WWW-Authenticate": `Bearer realm="${BASE_URL}"` },
+        { "WWW-Authenticate": `Bearer realm="${BASE_URL}", resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"` },
       )
     }
   }
