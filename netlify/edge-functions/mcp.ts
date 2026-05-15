@@ -19,7 +19,7 @@ const MCP_SECRET            = Netlify.env.get("MCP_SECRET")            ?? ""
 const SUPABASE_URL          = Netlify.env.get("SUPABASE_URL")          ?? ""
 const SUPABASE_SERVICE_KEY  = Netlify.env.get("SUPABASE_SERVICE_KEY")  ?? ""
 const BASE_URL              = Netlify.env.get("BASE_URL")              ?? "https://mcp.kndlandscaping.com"
-const DEPLOY_VERSION        = "4.1.0"
+const DEPLOY_VERSION        = "4.2.0"
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
@@ -255,12 +255,12 @@ const TOOLS = [
   },
   {
     name: "get_profit_and_loss",
-    description: "Get the full raw QBO Profit & Loss payload for a specific period and optional class. For most analytical questions prefer `get_pl_summary` which is faster. Use this only when you need the raw QBO structure.",
+    description: "Get the full raw QBO Profit & Loss payload for a specific period and optional class. For most analytical questions prefer `get_pl_summary` which is faster. Use this only when you need the raw QBO structure. When `class_name` is provided, the result is reduced from the `ProfitAndLossByClass` report, so date coverage matches that report's range (see `list_available_periods`).",
     inputSchema: { type: "object", properties: { period_start: { type: "string", description: "YYYY-MM-DD" }, period_end: { type: "string", description: "YYYY-MM-DD" }, class_name: { type: "string", description: "Optional QBO class name." }, include_subclasses: { type: "boolean", description: "Default true." } }, required: ["period_start", "period_end"] },
   },
   {
     name: "get_pl_summary",
-    description: "Get a clean, structured P&L summary. Preferred for most financial questions.",
+    description: "Get a clean, structured P&L summary. Preferred for most financial questions. When `class_name` is provided, the result is reduced from the `ProfitAndLossByClass` report, so date coverage matches that report's range (see `list_available_periods`).",
     inputSchema: { type: "object", properties: { period_start: { type: "string", description: "YYYY-MM-DD" }, period_end: { type: "string", description: "YYYY-MM-DD" }, class_name: { type: "string", description: "Optional QBO class name." }, include_subclasses: { type: "boolean", description: "Default true." } }, required: ["period_start", "period_end"] },
   },
   {
@@ -546,7 +546,26 @@ async function handleTool(name: string, args: Record<string, unknown>) {
     const reportType = typeof args.report_type === "string" ? args.report_type : null
     const { data, error } = await supabase.rpc("list_available_periods_summary", { p_report_type: reportType })
     if (error) throw new Error(error.message)
-    return { __deploy: DEPLOY_VERSION, items: data ?? [] }
+    // Build response, appending a synthetic row that makes class-filtered P&L
+    // availability explicit. The MCP serves class-filtered queries by reducing
+    // the ProfitAndLossByClass row, so its date range is what callers actually
+    // get. Surfacing this prevents inference errors about whether or for which
+    // periods class filtering is supported.
+    const items: Array<Record<string, unknown>> = [...((data ?? []) as Array<Record<string, unknown>>)]
+    const byClass = items.find(row => row.report_type === "ProfitAndLossByClass")
+    if (byClass) {
+      items.push({
+        report_type:           "ProfitAndLoss",
+        class_name:            "<any class from list_classes>",
+        count:                 byClass.count,
+        earliest_period_start: byClass.earliest_period_start,
+        latest_period_end:     byClass.latest_period_end,
+        last_fetched_at:       byClass.last_fetched_at,
+        served_by:             "ProfitAndLossByClass via class-column reduction",
+        note:                  "Pass class_name to get_profit_and_loss or get_pl_summary. Date coverage matches the ProfitAndLossByClass row.",
+      })
+    }
+    return { __deploy: DEPLOY_VERSION, items }
   }
   if (name === "get_profit_and_loss") {
     if (typeof args.period_start !== "string" || typeof args.period_end !== "string") throw new Error("period_start and period_end are required")
