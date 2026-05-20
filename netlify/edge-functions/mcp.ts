@@ -19,7 +19,8 @@ const MCP_SECRET            = Netlify.env.get("MCP_SECRET")            ?? ""
 const SUPABASE_URL          = Netlify.env.get("SUPABASE_URL")          ?? ""
 const SUPABASE_SERVICE_KEY  = Netlify.env.get("SUPABASE_SERVICE_KEY")  ?? ""
 const BASE_URL              = Netlify.env.get("BASE_URL")              ?? "https://mcp.kndlandscaping.com"
-const DEPLOY_VERSION        = "4.2.0"
+const DEPLOY_VERSION        = "4.3.0-bva-monthly"
+const BACKFILL_SECRET       = Netlify.env.get("BACKFILL_SECRET")       ?? ""
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
@@ -294,6 +295,18 @@ const TOOLS = [
     name: "get_budget_vs_actuals",
     description: "Budget vs Actuals for a date range. Returns actual P&L and matched budget side by side, broken down by revenue (Commercial/Residential/Maintenance/Enhancements/Irrigation), COGS by division, expense categories (G&A subcategories: staff, travel, emp_other, training, utilities, rent, insurance, office, comms, prof_services; Operations subcategories: auto_truck, safety, repairs, yard, tools; S&M total), gross profit, OpEx, and NOI. Budget is matched by year prefix on start_date so requires a budget covering the relevant fiscal year in qbo_budgets. Requires actuals for the exact period in qbo_reports.",
     inputSchema: { type: "object", properties: { period_start: { type: "string", description: "YYYY-MM-DD" }, period_end: { type: "string", description: "YYYY-MM-DD" } }, required: ["period_start", "period_end"] },
+  },
+  {
+    name: "get_bva_monthly_data",
+    description: "Return ALL data the K&D monthly BVA skill needs for a given target year + month in a single bundled response. Constructs MTD, YTD, PY MTD, PY YTD, R12, and R12-prior windows for Consolidated + Commercial + Residential + MEW + SLO + the two OH pools (Gen/Support Ovrhd, zOvhds - Other), summing cached monthly ProfitAndLossByClass snapshots as needed. Each entity/period contains pre-parsed accounts (with section path) and group totals (revenue, COGS, gross profit, G&A/Ops/S&M section totals, NOI, other income/expense, net income, OH staff cost). MEW intentionally includes SLO per K&D budget convention; SLO is also returned standalone. Response is ~1MB; call exactly once per monthly run. If any required monthly snapshot is missing the function returns a 404 with the list of missing periods; fix by running qbo-backfill for those periods.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target_year:  { type: "integer", description: "Four-digit calendar year of the target month (e.g. 2026)." },
+        target_month: { type: "integer", description: "Calendar month 1-12 of the target month (e.g. 4 for April)." },
+      },
+      required: ["target_year", "target_month"],
+    },
   },
   {
     name: "get_sync_health",
@@ -637,6 +650,23 @@ async function handleTool(name: string, args: Record<string, unknown>) {
   if (name === "get_budget_vs_actuals") {
     if (typeof args.period_start !== "string" || typeof args.period_end !== "string") throw new Error("period_start and period_end are required")
     return await computeBudgetVsActuals(args.period_start, args.period_end)
+  }
+  if (name === "get_bva_monthly_data") {
+    const ty = args.target_year
+    const tm = args.target_month
+    if (typeof ty !== "number" || !Number.isInteger(ty)) throw new Error("target_year must be an integer (e.g. 2026)")
+    if (typeof tm !== "number" || !Number.isInteger(tm) || tm < 1 || tm > 12) throw new Error("target_month must be an integer 1-12")
+    if (!BACKFILL_SECRET) throw new Error("BACKFILL_SECRET env var not configured on this project; required to call bva-monthly-data.")
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/bva-monthly-data`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ secret: BACKFILL_SECRET, target_year: ty, target_month: tm }),
+    })
+    if (!res.ok) {
+      const errBody = await res.text()
+      throw new Error(`bva-monthly-data fetch failed (${res.status}): ${errBody}`)
+    }
+    return await res.json()
   }
   if (name === "get_sync_health") {
     const { data, error } = await supabase.rpc("qbo_sync_health")
